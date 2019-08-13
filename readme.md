@@ -1,0 +1,3 @@
+To install:
+
+`makepkg -i`
