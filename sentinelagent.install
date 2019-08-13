@@ -1,0 +1,489 @@
+# Specifies names.
+sentinel_name="sentinel"
+agent="sentinelone"
+group_name="${sentinel_name}"
+user_name="${group_name}"
+
+# Specifies agent's directories
+agent_directory="/opt/${agent}"
+libraries_directory="${agent_directory}/lib"
+binaries_directory="${agent_directory}/bin"
+home_directory="${agent_directory}/home"
+configuration_directory="${agent_directory}/configuration"
+assets_directory="${agent_directory}/assets"
+log_directory="${agent_directory}/log"
+
+old_agent_path="/usr/sentinelagent"
+
+# Specifies sets of agent's directory for chown and chmod procedures.
+top_directories=("${agent_directory}" "${libraries_directory}" "${binaries_directory}" "${configuration_directory}" "${assets_directory}" "${log_directory}" "${home_directory}")
+
+# Specifies groups and users files.
+groups_file="/etc/group"
+users_file="/etc/passwd"
+
+# Specifies the log paths.
+uninstallation_log_path="/tmp/sentinel_uninstall.log"
+installation_log_path="/tmp/sentinel_install.log"
+
+# Specifies the installation log path.
+installation_log_final_path="${log_directory}/install.log"
+
+sysvinit_daemon="sentineld"
+sysvinit_initd_directory="/etc/init.d/"
+systemd_service_unit="sentinelone.service"
+systemd_service_directory="/usr/lib/systemd/system/"
+
+no_login="/usr/bin/nologin"
+
+#######################################
+# Append a log message to the installation log.
+#######################################
+write_log_message() {
+        should_echo=1
+        current_date=$(date -u +"%y-%m-%d %R:%S.%3N")
+        echo "[${current_date}] $1" >> ${installation_log_path}
+
+        if [ "${should_echo}" -ne "0" ]; then
+                echo "$1"
+        fi
+}
+
+#######################################
+# Specifies an assert function for command results.
+# Exits if command did not success.
+#######################################
+assert() {
+        if [ $? -ne 0 ]; then
+                write_log_message "ERROR: Command failed: ${1}" 1
+        fi
+}
+
+#######################################
+# Get the relevant directory for systemd
+#######################################
+get_systemd_folder() {
+        possible_systemd_paths=("/usr/lib/systemd/system/" "/usr/lib/systemd/system/")
+        for path in ${possible_systemd_paths[@]}; do
+                if [ -d "$path" ]; then
+                        systemd_service_directory=$path
+                fi
+        done	
+}
+
+
+#######################################
+# Unregister the daemon's service.
+# Currently supporting update-rc.d (Common in deb distros),
+# and chkconfig (Common in SystemV distros - rpm distro such as: RedHat, Centos, SLES an OpenSUSE).
+#######################################
+unregister_service() {
+        write_log_message "Unregistering agent service"
+
+        #check if the systemctl exist and functional
+        systemctl > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                write_log_message "Disabling ${systemd_service_unit} service"
+                systemctl disable "${systemd_service_unit}" > /dev/null 2>&1
+                assert "systemctl"
+                # Remove service file
+                get_systemd_folder
+                rm -f "${systemd_service_directory}/${systemd_service_unit}"
+                assert "rm"
+        elif command -v update-rc.d > /dev/null 2>&1; then
+                update-rc.d -f "${sysvinit_daemon}" remove
+                assert "update-rc.d"
+                # Remove the sysvinit script
+                rm -f "${sysvinit_initd_directory}/${sysvinit_daemon}"
+                assert "rm"
+        # There is no need to delete it using chkconfig.
+        elif command -v chkconfig > /dev/null 2>&1; then
+                :
+        else
+                write_log_message "ERROR: Could not locate and execute update-rc.d or chkconfig" 1
+        fi
+
+        write_log_message "Agent service unregistered successfully"
+}
+
+#######################################
+# Stop the daemon's service.
+#######################################
+stop_service() {
+        write_log_message "Stopping agent service"
+
+        # in case dpkg was called directly (instead of calling "sentinelctl control upgrade/uninstall")
+        # dpkg will try to stop the agent with sentinelctl, but will NOT block for passphrase input
+        # instead he will ignore the input and continue without stopping the agent which will result with errors
+        # to resolve that we pass wrong passphrase which will cause one of the following:
+        # 1. If the agent never connected to management, passphrase is ignored and you can stop
+        # 2. If the agent connected to management, the passphrase will be wrong and we will
+        #    get an error return code and fail the uninstall/upgrade
+        /opt/sentinelone/bin/sentinelctl control stop --passphrase "0" > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                write_log_message "Could not stop agent. failed."
+                write_log_message "Failed stopping the agent, please use 'sentinelctl' directly to uninstall/upgrade." 1
+        fi
+
+        write_log_message "Agent service stopped successfully"
+}
+
+#######################################
+# Register the sysvinit_daemon as a service.
+# Currently supporting update-rc.d (Common in deb distros),
+# and chkconfig (Common in SystemV distros - rpm distro such as: RedHat, Centos, SLES an OpenSUSE).
+#######################################
+register_service() {
+        write_log_message "Registering agent service"
+
+        #check if the systemctl exist and functional
+        systemctl > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                get_systemd_folder
+                write_log_message "systemctl was found, enabling service file"
+                cp "${configuration_directory}/${systemd_service_unit}" "${systemd_service_directory}"
+                systemctl enable "${systemd_service_unit}" > /dev/null 2>&1
+                assert "systemctl"
+                /opt/sentinelone/bin/sentinelctl control set-service-type systemd
+        elif command -v update-rc.d > /dev/null 2>&1; then
+                cp "${configuration_directory}/${sysvinit_daemon}" "${sysvinit_initd_directory}"
+                update-rc.d "${sysvinit_daemon}" defaults
+                assert "update-rc.d"
+                /opt/sentinelone/bin/sentinelctl control set-service-type sysvinit
+        elif command -v chkconfig > /dev/null 2>&1; then
+                cp "${configuration_directory}/${sysvinit_daemon}" "${sysvinit_initd_directory}"
+                chkconfig --add "${sysvinit_daemon}"
+                assert "chkconfig"
+                /opt/sentinelone/bin/sentinelctl control set-service-type sysvinit
+        else
+                write_log_message "ERROR: Could not locate and execute update-rc.d or chkconfig" 1
+        fi
+
+        assert "set service type"
+
+        write_log_message "Agent service registered successfully"
+}
+
+#######################################
+# Remove all our kprobes.
+# NOTE: The `/opt/sentinelone/mount` mountpoint must exist for this function to work!
+#######################################
+remove_kprobes() {
+        kprobe_names=("s1chdirenter" "s1dsoenter" "s1fcreate" "s1unlinkenter" "s1unlinkatenter" "s1renameenter" "s1renameatenter" "s1renameat2enter")
+        tracefs_path="/opt/sentinelone/mount"
+
+        fs_type="$(cat /proc/self/mounts | grep sentitrace | cut -d' ' -f3)"
+        if [ -z "$fs_type" ]; then
+                write_log_message "Could not find mountpoint, not removing kprobes"
+                return
+        elif [ "$fs_type" == "debugfs" ]; then
+                tracefs_path="$tracefs_path/tracing"
+        fi
+
+        write_log_message "Disabling kprobes"
+        for kprobe in ${kprobe_names[@]}; do
+                current_path="$tracefs_path/events/kprobes/$kprobe"
+                if [ ! -d "$current_path" ]; then
+                        # this kprobe doesn't exist
+                        continue
+                fi
+
+                # disable the kprobe
+                echo 0 > "$current_path/enable"
+        done
+
+        write_log_message "Removing kprobes"
+        for kprobe in ${kprobe_names[@]}; do
+                current_path="$tracefs_path/events/kprobes/$kprobe"
+                if [ ! -d "$current_path" ]; then
+                        # this kprobe doesn't exist
+                        continue
+                fi
+
+                # disable the kprobe
+                echo "-:$kprobe" > "$tracefs_path/kprobe_events" 2>/dev/null
+        done
+
+        write_log_message "Kprobes removed successfully"
+}
+
+# Validate that root is running (might be redundant)
+
+# Aggregate all configuration from environment variables into local configuration
+
+# Create group and user for sentinel
+
+export PATH="/sbin:/bin:/usr/sbin:/usr/bin"
+
+#######################################
+# Checks if user and group name exists already and warns if they do.
+# If user and group are exist, deletes them.
+# Eventually a new user will be created as a system account, with same group name
+# as the user's and there won't be login nor an home directory.
+#######################################
+setup_user() {
+        write_log_message "Creating user ${user_name}"
+
+        if grep -q -w "^${user_name}" "${users_file}"; then
+                write_log_message "User ${user_name} already exists"
+                write_log_message "Going to remove user ${user_name}"
+                userdel "${user_name}"
+        fi
+
+        if grep -q -w "^${group_name}" "${groups_file}"; then
+                write_log_message "Group ${group_name} already exists"
+                write_log_message "Going to remove group ${group_name}"
+                groupdel "${group_name}"
+        fi
+
+        # -r == system account, won't create a home directory.
+        # -U == Create a group with the same name as the user.
+        # -d == Set the home directory.
+        # -s == shell, run nologin.
+        useradd -r -U -d "${home_directory}" -s "${no_login}" "${user_name}"
+        assert "useradd"
+
+        write_log_message "User ${user_name} created successfully"
+}
+
+#######################################
+# Prepare installation by verifying binaries, envrionment variables (relevant for site token),
+# and setup group and user.
+#######################################
+pre_install() {
+        write_log_message "Starting installation"
+
+        validate_sse4
+
+        stop_old_agent
+        setup_user
+}
+
+#######################################
+# Prepare upgrade by creating by stopping and unregistering
+# the daemon service.
+#######################################
+pre_upgrade() {
+        write_log_message "Starting upgrade"
+
+        # Unmount our mountpoint, if it exists.
+        umount /opt/sentinelone/mount > /dev/null 2> /dev/null
+
+        # We stop the service in case we weren't
+        # called via 'sentinelctl control upgrade'
+        stop_service
+
+        # We get a new service file every upgrade,
+        # so we remove the current service and we'll
+        # reinstall it on post-upgrade.
+        unregister_service
+}
+
+#######################################
+# Stop the old agent if it exists
+#######################################
+stop_old_agent() {
+        if [ -d "${old_agent_path}" ]; then
+                write_log_message "Found old agent installation, going to stop agent"
+                /etc/init.d/sentineld force_stop > /dev/null 2>&1
+        fi
+}
+
+#######################################
+# Validate the computer supports SSE 4.1 and/or 4.2.
+#######################################
+validate_sse4() {
+        grep "sse4" /proc/cpuinfo > /dev/null
+        if [ $? -ne 0 ]; then
+                write_log_message "ERROR: SSE4 is not supported on this machine." 1
+        fi
+}
+
+post_install() {
+
+    set_permissions
+    disable_account_login
+    register_service
+    add_ctl_to_path
+    remove_old_agent
+
+    # is a desktop or workstation environment and set the right icon in the UI
+    validate_desktop
+
+    write_log_message "Installation finished successfully"
+    mv -f "${installation_log_path}" "${installation_log_final_path}"
+}
+
+#######################################
+# Perform post-upgraded, set permissions(chown and chmod),
+# redisabling account login, reregistering the service,
+# and overriding the existing sentinelctl symlinks
+#######################################
+post_upgrade() {
+        set_permissions
+        disable_account_login
+        register_service
+        add_ctl_to_path
+
+        write_log_message "Upgrade finished successfully"
+        cat "${installation_log_path}" >> "${installation_log_final_path}"
+}
+
+#######################################
+# Define ownership upon the agent top directories, define r/w for nonexcutable directories.
+# Define r/w/x for bin directory.
+# All of the directories are having a sticky bit in order to allow only the owner (sentinel user), to manipulate them.
+#######################################
+set_permissions() {
+        write_log_message "Setting permissions"
+
+        for ((i = 0; i<${#top_directories[@]}; i++)); do
+                chown -R "${group_name}":"${user_name}" "${top_directories[$i]}"
+                assert "chown"
+        done
+
+        write_log_message "Permissions set successfully"
+}
+
+#######################################
+# Disables login to the sentinel account by adding shell rc files that exit.
+#######################################
+disable_account_login() {
+        write_log_message "Disabling ${user_name} account login"
+
+        for ((i = 0; i<${#shell_rc_files[@]}; i++)); do
+                rm -f "${home_directory}/${shell_rc_files[$i]}"
+                assert "rm"
+
+                ln -s "${home_directory}/login.sh" "${home_directory}/${shell_rc_files[$i]}"
+                assert "ln"
+        done
+
+        write_log_message "${user_name} account login disabled successfully"
+}
+
+#######################################
+# Add sentinelctl to $PATH
+# creates link from bin directory to /opt/sentinelone/bin/sentinelctl
+#######################################
+add_ctl_to_path() {
+    if [ -d "/usr/bin" ]; then
+        rm -f /usr/bin/sentinelctl
+        ln -s /opt/sentinelone/bin/sentinelctl /usr/bin/sentinelctl
+    elif [ -d "/usr/bin" ]; then
+        rm -f /usr/bin/sentinelctl
+        ln -s /opt/sentinelone/bin/sentinelctl /usr/bin/sentinelctl
+    elif [ -d "/bin" ]; then
+        rm -f /usr/bin/sentinelctl
+        ln -s /opt/sentinelone/bin/sentinelctl /usr/bin/sentinelctl
+    fi
+}
+
+#######################################
+# Try figuring out if this is a desktop
+# and configure the agent accordingly
+#######################################
+validate_desktop() {
+        # Check in os-release file if this is
+        # a desktop or workstation variant
+        if [ -f "/etc/os-release" ]; then
+                if grep -q -i "desktop" "/etc/os-release"; then
+                        write_log_message "Detected desktop machine, setting correct type"
+                        "${binaries_directory}"/sentinelctl management type set desktop	> /dev/null 2>&1
+                fi
+
+                if grep -q -i "workstation" "/etc/os-release"; then
+                        write_log_message "Detected workstation machine, setting correct type"
+                        "${binaries_directory}"/sentinelctl management type set desktop	> /dev/null 2>&1
+                fi
+        fi
+}
+
+#######################################
+# Remove the old agent if it exists
+#######################################
+remove_old_agent() {
+        if [ -d "${old_agent_path}" ]; then
+                write_log_message "Removing old agent leftovers"
+                rm -rf "${old_agent_path}"
+        fi
+}
+
+pre_remove() {
+
+    write_log_message "Starting uninstallation"
+
+    # Remove any existing kprobes
+    remove_kprobes
+
+    # Unmount our mountpoint, if it exists.
+    umount /opt/sentinelone/mount > /dev/null 2> /dev/null
+
+    # NOTE: This function call should fail if called directly through the package manager
+    stop_service
+}
+
+post_remove() {
+
+    unregister_service
+    remove_files
+    remove_user
+    remove_ctl_from_path
+
+    write_log_message "Uninstallation finished successfully"
+}
+
+#######################################
+# Delete top directories.
+#######################################
+remove_files() {
+        write_log_message "Removing files"
+
+        for ((i = 0; i<${#top_directories[@]}; i++)); do
+                rm -rf "${top_directories[$i]}"
+                assert "rm"
+        done
+
+        write_log_message "Files removed successfully"
+}
+
+#######################################
+# Remove user and group. If user and group already exist, a warning will be presence.
+#######################################
+remove_user() {
+        write_log_message "Removing user ${user_name}"
+
+        if grep -q -w "${user_name}" "${users_file}"; then
+                userdel "${user_name}"
+                assert "userdel"
+        else
+                write_log_message "WARNING: User removal failed: user ${user_name} does not exist" 1
+        fi
+
+        write_log_message "User ${user_name} removed successfully"
+        write_log_message "Removing group ${group_name}"
+
+        if grep -q -w "${group_name}" "${groups_file}"; then
+                groupdel "${group_name}"
+                assert "groupdel"
+        # NOTE: Else, don't warn about group nonexistence, on ubuntu userdel deletes the group.
+        fi
+
+        write_log_message "Group ${group_name} removed successfully"
+}
+
+#######################################
+# remove sentinelctl from $PATH
+# removes link from bin directory
+#######################################
+remove_ctl_from_path() {
+
+    if [ -L "/usr/bin/sentinelctl" ]; then
+        rm /usr/bin/sentinelctl
+    elif [ -L "/usr/bin/sentinelctl" ]; then
+        rm /usr/bin/sentinelctl
+    elif [ -L "/usr/bin/sentinelctl" ]; then
+        rm /usr/bin/sentinelctl
+    fi
+}
+
